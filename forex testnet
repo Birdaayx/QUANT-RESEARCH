@@ -1,12 +1,12 @@
 
-// XAU QUANT – FINAL CLEAN (VOL REGIME + DYNAMIC LEVERAGE)
+// QUANT TRADING ALGO BOT (USING REGIME AND MEAN REVERSION)
 
 #property strict
 
 #include <Trade/Trade.mqh>
 CTrade trade;
 
-//INPUTS 
+// INPUTS 
 input double BaseRiskUSD     = 0.5;
 
 input int    ATR_Fast        = 5;
@@ -27,14 +27,14 @@ input double MinLeverage    = 50;
 input double BaseLeverage   = 80;
 input double MaxLeverage   = 100;
 
-///==================== GLOBAL ====================//
+// GLOBAL 
 datetime last_bar = 0;
 int bars_after_trade = 999;
 
 int atrFastHandle;
 int atrSlowHandle;
 
-//==================== INIT ====================//
+// INIT 
 int OnInit()
 {
    atrFastHandle = iATR(_Symbol, PERIOD_M1, ATR_Fast);
@@ -48,14 +48,14 @@ int OnInit()
    return INIT_SUCCEEDED;
 }
 
-//==================== DEINIT ====================//
+// DEINIT 
 void OnDeinit(const int reason)
 {
    IndicatorRelease(atrFastHandle);
    IndicatorRelease(atrSlowHandle);
 }
 
-//==================== ATR READ ====================//
+// ATR READ
 double ReadATR(int handle)
 {
    double buf[];
@@ -64,7 +64,7 @@ double ReadATR(int handle)
    return buf[0];
 }
 
-//==================== ON TICK ====================//
+// ON TICK 
 void OnTick()
 {
    datetime t = iTime(_Symbol, PERIOD_M1, 0);
@@ -81,7 +81,7 @@ void OnTick()
    if(bars_after_trade < CooldownBars)
       return;
 
-   // ===== ATR =====
+   // ATR 
    double atr_fast = ReadATR(atrFastHandle);
    double atr_slow = ReadATR(atrSlowHandle);
    if(atr_fast <= 0 || atr_slow <= 0)
@@ -92,7 +92,7 @@ void OnTick()
    if(vol_ratio < CompressRatio)
       return;
 
-   // ===== PRICE & SPREAD =====
+   // PRICE & SPREAD 
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double spread = ask - bid;
@@ -100,7 +100,7 @@ void OnTick()
    if(spread > atr_slow * MaxSpreadATR)
       return;
 
-   // ===== STRUCTURE =====
+   // STRUCTURE 
    int hi = iHighest(_Symbol, PERIOD_M1, MODE_HIGH, Lookback, 1);
    int lo = iLowest (_Symbol, PERIOD_M1, MODE_LOW , Lookback, 1);
    if(hi < 0 || lo < 0)
@@ -116,7 +116,7 @@ void OnTick()
    if(!longSignal && !shortSignal)
       return;
 
-   // ===== SL / TP =====
+   // SL / TP 
    double sl_dist = atr_fast * SL_ATR;
    double tp_dist = atr_slow * TP_ATR_SLOW;
 
@@ -124,7 +124,7 @@ void OnTick()
    if(sl_dist < stopLevel || tp_dist < stopLevel)
       return;
 
-   // ===== RISK-BASED LOT =====
+   // RISK-BASED LOT
    double tickVal = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
    double tickSz  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
    if(tickVal <= 0 || tickSz <= 0)
@@ -145,7 +145,7 @@ void OnTick()
    if(lot < minLot)
       return;
 
-   // ===== EXECUTION =====
+   // EXECUTION 
    trade.SetDeviationInPoints(20);
 
    bool ok;
