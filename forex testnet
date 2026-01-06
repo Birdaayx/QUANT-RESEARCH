@@ -33,6 +33,18 @@ int bars_after_trade = 999;
 
 int atrFastHandle;
 int atrSlowHandle;
+// UTILS
+double Clamp(double x, double lo, double hi)
+{
+   return MathMax(lo, MathMin(x, hi));
+}
+
+double SafeLot(double rawLot, double minLot, double maxLot, double step)
+{
+   rawLot = MathMax(minLot, MathMin(rawLot, maxLot));
+   double k = MathFloor((rawLot + 1e-9) / step);
+   return NormalizeDouble(k * step, 2);
+}
 
 // INIT 
 int OnInit()
