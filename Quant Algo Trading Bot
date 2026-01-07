@@ -208,7 +208,7 @@ void OnTick()
    bool breakoutDown = close1 < rangeLow;
    if(!breakoutUp && !breakoutDown) return;
 
-   // SL / TP
+   // SL/TP
    double sl_dist = atrF * SL_ATR;
    double tp_dist = atrS * TP_ATR;
 
