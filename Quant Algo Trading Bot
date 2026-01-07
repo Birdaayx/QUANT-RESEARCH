@@ -1,0 +1,137 @@
+
+// XAU QUANT – REGIME AWARE, CONVEX PAYOFF
+#property strict
+#include <Trade/Trade.mqh>
+CTrade trade;
+
+// INPUTS 
+input double RiskUSD        = 0.5;
+
+input int    ATR_Fast       = 5;
+input int    ATR_Slow       = 30;
+input int    Lookback       = 20;
+
+input double CompressRatio  = 0.75;
+input double ExpandRatio    = 1.15;
+
+input double SL_ATR         = 1.5;
+input double TP_ATR         = 3.5;
+
+input double MaxSpreadATR  = 0.25;
+input int    CooldownBars  = 4;
+
+// GLOBAL
+datetime last_bar = 0;
+int bars_after_trade = 999;
+
+int atrFastHandle;
+int atrSlowHandle;
+
+// INIT 
+int OnInit()
+{
+   atrFastHandle = iATR(_Symbol, PERIOD_M5, ATR_Fast);
+   atrSlowHandle = iATR(_Symbol, PERIOD_M5, ATR_Slow);
+
+   if(atrFastHandle == INVALID_HANDLE || atrSlowHandle == INVALID_HANDLE)
+      return INIT_FAILED;
+
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason)
+{
+   IndicatorRelease(atrFastHandle);
+   IndicatorRelease(atrSlowHandle);
+}
+
+// ATR 
+double ReadATR(int handle)
+{
+   double buf[];
+   if(CopyBuffer(handle, 0, 1, 1, buf) <= 0)
+      return 0;
+   return buf[0];
+}
+
+// ON TICK 
+void OnTick()
+{
+   datetime t = iTime(_Symbol, PERIOD_M5, 0);
+   if(t == last_bar) return;
+   last_bar = t;
+
+   bars_after_trade++;
+
+   if(PositionSelect(_Symbol)) return;
+   if(bars_after_trade < CooldownBars) return;
+
+   // ATR
+   double atrF = ReadATR(atrFastHandle);
+   double atrS = ReadATR(atrSlowHandle);
+   if(atrF <= 0 || atrS <= 0) return;
+
+   double vol_ratio = atrF / atrS;
+
+   // REGIME FILTER 
+   if(vol_ratio > ExpandRatio) return;          // NO TRADE IN EXPANSION
+   if(vol_ratio > CompressRatio) return;        // ONLY DEEP COMPRESSION
+
+   // PRICE & SPREAD
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double spread = ask - bid;
+
+   if(spread > atrS * MaxSpreadATR) return;
+
+   // STRUCTURE
+   int hi = iHighest(_Symbol, PERIOD_M5, MODE_HIGH, Lookback, 1);
+   int lo = iLowest (_Symbol, PERIOD_M5, MODE_LOW , Lookback, 1);
+   if(hi < 0 || lo < 0) return;
+
+   double rangeHigh = iHigh(_Symbol, PERIOD_M5, hi);
+   double rangeLow  = iLow (_Symbol, PERIOD_M5, lo);
+   double close1    = iClose(_Symbol, PERIOD_M5, 1);
+
+   bool breakoutUp   = close1 > rangeHigh;
+   bool breakoutDown = close1 < rangeLow;
+
+   if(!breakoutUp && !breakoutDown) return;
+
+   // SL / TP 
+   double sl_dist = atrF * SL_ATR;
+   double tp_dist = atrS * TP_ATR;
+
+   double stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+   if(sl_dist < stopLevel || tp_dist < stopLevel) return;
+
+   // POSITION SIZE 
+   double tickVal = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSz  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tickVal <= 0 || tickSz <= 0) return;
+
+   double loss_per_lot = sl_dist / tickSz * tickVal;
+   if(loss_per_lot <= 0) return;
+
+   double lot = RiskUSD / loss_per_lot;
+
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double step   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   lot = MathFloor(lot / step) * step;
+   lot = MathMax(minLot, MathMin(lot, maxLot));
+   if(lot < minLot) return;
+
+   //EXECUTION 
+   trade.SetDeviationInPoints(20);
+
+   bool ok;
+   if(breakoutUp)
+      ok = trade.Buy(lot, _Symbol, ask, ask - sl_dist, ask + tp_dist);
+   else
+      ok = trade.Sell(lot, _Symbol, bid, bid + sl_dist, bid - tp_dist);
+
+   if(ok)
+      bars_after_trade = 0;
+}
