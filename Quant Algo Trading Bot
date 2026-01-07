@@ -1,10 +1,10 @@
-
-// XAU QUANT – REGIME AWARE, CONVEX PAYOFF
+// XAU QUANT – REGIME AWARE WITH HMM FILTER
 #property strict
 #include <Trade/Trade.mqh>
 CTrade trade;
 
-// INPUTS 
+// Parameters
+
 input double RiskUSD        = 0.5;
 
 input int    ATR_Fast       = 5;
@@ -20,14 +20,49 @@ input double TP_ATR         = 3.5;
 input double MaxSpreadATR  = 0.25;
 input int    CooldownBars  = 4;
 
-// GLOBAL
+
+// Global 
+
 datetime last_bar = 0;
 int bars_after_trade = 999;
 
 int atrFastHandle;
 int atrSlowHandle;
 
-// INIT 
+
+// Hidden Markov Model 
+
+#define N_STATE 3
+#define N_OBS   2
+// State: 0 = Compression, 1 = Transition, 2 = Expansion
+
+double HMM_A[N_STATE][N_STATE] =
+{
+   {0.90, 0.10, 0.00},
+   {0.05, 0.85, 0.10},
+   {0.00, 0.15, 0.85}
+};
+
+double HMM_MU[N_STATE][N_OBS] =
+{
+   {0.0000, 0.60},
+   {0.0000, 1.00},
+   {0.0000, 1.80}
+};
+
+double HMM_VAR[N_STATE][N_OBS] =
+{
+   {1e-6, 0.05},
+   {1e-6, 0.10},
+   {1e-6, 0.25}
+};
+
+double HMM_PI[N_STATE] = {0.7, 0.2, 0.1};
+double hmm_alpha[N_STATE];
+
+
+// Initialization
+
 int OnInit()
 {
    atrFastHandle = iATR(_Symbol, PERIOD_M5, ATR_Fast);
@@ -35,6 +70,9 @@ int OnInit()
 
    if(atrFastHandle == INVALID_HANDLE || atrSlowHandle == INVALID_HANDLE)
       return INIT_FAILED;
+
+   for(int i = 0; i < N_STATE; i++)
+      hmm_alpha[i] = HMM_PI[i];
 
    return INIT_SUCCEEDED;
 }
@@ -45,7 +83,9 @@ void OnDeinit(const int reason)
    IndicatorRelease(atrSlowHandle);
 }
 
-// ATR 
+
+// Helpers
+
 double ReadATR(int handle)
 {
    double buf[];
@@ -54,7 +94,64 @@ double ReadATR(int handle)
    return buf[0];
 }
 
-// ON TICK 
+double GaussianPDF(double x, double mu, double var)
+{
+   double coeff = 1.0 / MathSqrt(2.0 * M_PI * var);
+   double expo  = MathExp(-0.5 * (x - mu) * (x - mu) / var);
+   return coeff * expo;
+}
+
+double HMM_Emission(int state, const double &obs[])
+{
+   double p = 1.0;
+   for(int i = 0; i < N_OBS; i++)
+      p *= GaussianPDF(obs[i], HMM_MU[state][i], HMM_VAR[state][i]);
+   return p;
+}
+
+
+void HMM_Update(const double &obs[])
+{
+   double next_alpha[N_STATE];
+
+   for(int j = 0; j < N_STATE; j++)
+   {
+      double sum = 0.0;
+      for(int i = 0; i < N_STATE; i++)
+         sum += hmm_alpha[i] * HMM_A[i][j];
+
+      next_alpha[j] = sum * HMM_Emission(j, obs);
+   }
+
+   double norm = 0.0;
+   for(int i = 0; i < N_STATE; i++)
+      norm += next_alpha[i];
+
+   if(norm <= 0) return;
+
+   for(int i = 0; i < N_STATE; i++)
+      hmm_alpha[i] = next_alpha[i] / norm;
+}
+
+int HMM_State()
+{
+   int best = 0;
+   double maxp = hmm_alpha[0];
+
+   for(int i = 1; i < N_STATE; i++)
+   {
+      if(hmm_alpha[i] > maxp)
+      {
+         maxp = hmm_alpha[i];
+         best = i;
+      }
+   }
+   return best;
+}
+
+
+// Main loop
+
 void OnTick()
 {
    datetime t = iTime(_Symbol, PERIOD_M5, 0);
@@ -73,39 +170,52 @@ void OnTick()
 
    double vol_ratio = atrF / atrS;
 
-   // REGIME FILTER 
-   if(vol_ratio > ExpandRatio) return;          // NO TRADE IN EXPANSION
-   if(vol_ratio > CompressRatio) return;        // ONLY DEEP COMPRESSION
+   // HMM observation
+   double close1 = iClose(_Symbol, PERIOD_M5, 1);
+   double close2 = iClose(_Symbol, PERIOD_M5, 2);
+   if(close2 <= 0) return;
 
-   // PRICE & SPREAD
+   double obs[N_OBS];
+   obs[0] = MathLog(close1 / close2);
+   obs[1] = vol_ratio;
+
+   HMM_Update(obs);
+   int hmm_state = HMM_State();
+
+   // Regime filter (double layer)
+   if(vol_ratio > ExpandRatio) return;
+   if(hmm_state == 2) return;
+
+   if(vol_ratio > CompressRatio) return;
+   if(hmm_state != 0) return;
+
+   // Spread filter
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double spread = ask - bid;
 
    if(spread > atrS * MaxSpreadATR) return;
 
-   // STRUCTURE
+   // Structure breakout
    int hi = iHighest(_Symbol, PERIOD_M5, MODE_HIGH, Lookback, 1);
    int lo = iLowest (_Symbol, PERIOD_M5, MODE_LOW , Lookback, 1);
    if(hi < 0 || lo < 0) return;
 
    double rangeHigh = iHigh(_Symbol, PERIOD_M5, hi);
    double rangeLow  = iLow (_Symbol, PERIOD_M5, lo);
-   double close1    = iClose(_Symbol, PERIOD_M5, 1);
 
    bool breakoutUp   = close1 > rangeHigh;
    bool breakoutDown = close1 < rangeLow;
-
    if(!breakoutUp && !breakoutDown) return;
 
-   // SL / TP 
+   // SL / TP
    double sl_dist = atrF * SL_ATR;
    double tp_dist = atrS * TP_ATR;
 
    double stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
    if(sl_dist < stopLevel || tp_dist < stopLevel) return;
 
-   // POSITION SIZE 
+   // Position sizing
    double tickVal = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
    double tickSz  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
    if(tickVal <= 0 || tickSz <= 0) return;
@@ -123,7 +233,7 @@ void OnTick()
    lot = MathMax(minLot, MathMin(lot, maxLot));
    if(lot < minLot) return;
 
-   //EXECUTION 
+   // Execution
    trade.SetDeviationInPoints(20);
 
    bool ok;
