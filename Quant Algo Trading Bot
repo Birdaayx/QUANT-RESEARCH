@@ -1,72 +1,65 @@
 
-// XAU QUANT – REGIME AWARE WITH LOG-HMM 
+// SCALP QUANT – REGIME ADAPTIVE
 
 #property strict
 #include <Trade/Trade.mqh>
 CTrade trade;
 
-// INPUTS
+// INPUTS 
 input double RiskUSD        = 0.5;
 
 input int    ATR_Fast       = 5;
 input int    ATR_Slow       = 30;
-input int    Lookback       = 20;
+input int    Lookback       = 15;
 
-input double CompressRatio  = 0.75;
-input double ExpandRatio    = 1.15;
+input double SL_ATR_Base    = 1.2;
+input double TP_ATR_Base    = 1.8;
 
-input double SL_ATR         = 1.5;
-input double TP_ATR         = 3.5;
-
-input double MaxSpreadATR  = 0.25;
-input int    CooldownBars  = 4;
+input double MaxSpreadATR  = 0.6;
+input int    CooldownBars  = 2;
 
 // GLOBAL 
 datetime last_bar = 0;
 int bars_after_trade = 999;
 
-int atrFastHandle;
-int atrSlowHandle;
+int atrFastHandle, atrSlowHandle;
 
-// Hidden Markov 
+// HMM 
 #define N_STATE 3
 #define N_OBS   2
-// State: 0 = Compression, 1 = Transition, 2 = Expansion
+// 0=Compression | 1=Transition | 2=Expansion
 
 double HMM_A[N_STATE][N_STATE] =
 {
-   {0.90, 0.10, 0.00},
-   {0.05, 0.85, 0.10},
-   {0.00, 0.15, 0.85}
+   {0.80, 0.20, 0.00},
+   {0.15, 0.70, 0.15},
+   {0.05, 0.30, 0.65}
 };
 
 double HMM_MU[N_STATE][N_OBS] =
 {
-   {0.0, 0.6},
+   {0.0, 0.7},
    {0.0, 1.0},
-   {0.0, 1.8}
+   {0.0, 1.4}
 };
 
 double HMM_VAR[N_STATE][N_OBS] =
 {
-   {1e-6, 0.05},
    {1e-6, 0.10},
-   {1e-6, 0.25}
+   {1e-6, 0.20},
+   {1e-6, 0.35}
 };
 
-// log-alpha (filtering probability)
 double log_alpha[N_STATE];
 
-// INIT
+// INIT 
 int OnInit()
 {
    atrFastHandle = iATR(_Symbol, PERIOD_M5, ATR_Fast);
    atrSlowHandle = iATR(_Symbol, PERIOD_M5, ATR_Slow);
-
    if(atrFastHandle == INVALID_HANDLE || atrSlowHandle == INVALID_HANDLE)
       return INIT_FAILED;
 
-   // Uniform prior (log)
    for(int i=0;i<N_STATE;i++)
       log_alpha[i] = MathLog(1.0 / N_STATE);
 
@@ -87,7 +80,6 @@ double ReadATR(int handle)
    return buf[0];
 }
 
-// Log Gaussian PDF
 double LogGaussian(double x,double mu,double var)
 {
    if(var <= 0) return -1e10;
@@ -95,18 +87,14 @@ double LogGaussian(double x,double mu,double var)
           + (x-mu)*(x-mu)/var);
 }
 
-// Log emission probability
 double LogEmission(int state,const double &obs[])
 {
    double logp = 0.0;
    for(int i=0;i<N_OBS;i++)
-      logp += LogGaussian(obs[i],
-                          HMM_MU[state][i],
-                          HMM_VAR[state][i]);
+      logp += LogGaussian(obs[i], HMM_MU[state][i], HMM_VAR[state][i]);
    return logp;
 }
 
-// HMM LOG-SPACE
 void HMM_Update(const double &obs[])
 {
    double next_log_alpha[N_STATE];
@@ -115,19 +103,15 @@ void HMM_Update(const double &obs[])
    {
       double maxv = -1e100;
       for(int i=0;i<N_STATE;i++)
-         maxv = MathMax(maxv,
-               log_alpha[i] + MathLog(HMM_A[i][j]));
+         maxv = MathMax(maxv, log_alpha[i] + MathLog(HMM_A[i][j]));
 
       double sum = 0.0;
       for(int i=0;i<N_STATE;i++)
-         sum += MathExp(log_alpha[i]
-               + MathLog(HMM_A[i][j]) - maxv);
+         sum += MathExp(log_alpha[i] + MathLog(HMM_A[i][j]) - maxv);
 
-      next_log_alpha[j] =
-         maxv + MathLog(sum) + LogEmission(j,obs);
+      next_log_alpha[j] = maxv + MathLog(sum) + LogEmission(j,obs);
    }
 
-   // Normalize
    double max_all = next_log_alpha[0];
    for(int i=1;i<N_STATE;i++)
       max_all = MathMax(max_all,next_log_alpha[i]);
@@ -137,21 +121,18 @@ void HMM_Update(const double &obs[])
       norm += MathExp(next_log_alpha[i]-max_all);
 
    for(int i=0;i<N_STATE;i++)
-      log_alpha[i] =
-         next_log_alpha[i] - (max_all + MathLog(norm));
+      log_alpha[i] = next_log_alpha[i] - (max_all + MathLog(norm));
 }
 
-// Argmax regime
 int HMM_State()
 {
    int best = 0;
    for(int i=1;i<N_STATE;i++)
-      if(log_alpha[i] > log_alpha[best])
-         best = i;
+      if(log_alpha[i] > log_alpha[best]) best = i;
    return best;
 }
 
-// MAIN LOOP
+// MAIN 
 void OnTick()
 {
    datetime t = iTime(_Symbol, PERIOD_M5, 0);
@@ -159,18 +140,15 @@ void OnTick()
    last_bar = t;
 
    bars_after_trade++;
-
    if(PositionSelect(_Symbol)) return;
    if(bars_after_trade < CooldownBars) return;
 
-   // ATR
    double atrF = ReadATR(atrFastHandle);
    double atrS = ReadATR(atrSlowHandle);
    if(atrF<=0 || atrS<=0) return;
 
    double vol_ratio = atrF / atrS;
 
-   // Observation
    double c1 = iClose(_Symbol, PERIOD_M5, 1);
    double c2 = iClose(_Symbol, PERIOD_M5, 2);
    if(c1<=0 || c2<=0) return;
@@ -178,48 +156,52 @@ void OnTick()
    double obs[N_OBS];
    obs[0] = MathLog(c1/c2);
    obs[1] = vol_ratio;
-
-   // HMM filter
    HMM_Update(obs);
+
    int regime = HMM_State();
 
-   // REGIME FILTER 
-   if(vol_ratio > ExpandRatio) return;
-   if(regime == 2) return;           // expansion filtered
-   if(vol_ratio > CompressRatio) return;
-   if(regime != 0) return;           // only compression
-
-   // SPREAD FILTER 
    double ask = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol,SYMBOL_BID);
-   if(ask<=0 || bid<=0) return;
+   if((ask-bid) > atrS * MaxSpreadATR) return;
 
-   if((ask-bid) > atrS*MaxSpreadATR) return;
-
-   // STRUCTURE BREAKOUT
    int hi = iHighest(_Symbol,PERIOD_M5,MODE_HIGH,Lookback,1);
    int lo = iLowest (_Symbol,PERIOD_M5,MODE_LOW ,Lookback,1);
    if(hi<0 || lo<0) return;
 
-   double high = iHigh(_Symbol,PERIOD_M5,hi);
-   double low  = iLow (_Symbol,PERIOD_M5,lo);
-
-   bool up   = c1 > high;
-   bool down = c1 < low;
+   bool up   = c1 > iHigh(_Symbol,PERIOD_M5,hi);
+   bool down = c1 < iLow (_Symbol,PERIOD_M5,lo);
    if(!up && !down) return;
 
-   // SL/TP 
-   double sl = atrF*SL_ATR;
-   double tp = atrS*TP_ATR;
+   // REGIME ADAPTIVE RISK 
+   double sl_mult = SL_ATR_Base;
+   double tp_mult = TP_ATR_Base;
+   double riskAdj = 1.0;
+
+   if(regime == 2) {        // Expansion
+      tp_mult *= 0.7;
+      sl_mult *= 0.9;
+      riskAdj = 0.7;
+   }
+   else if(regime == 0) {   // Compression
+      tp_mult *= 1.2;
+}
+
+   // MONEY MANAGEMENT FIX 
+   double sl = atrF * sl_mult;
+   double tp = atrF * tp_mult;
 
    double tickVal = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
    double tickSz  = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
-   if(tickVal<=0 || tickSz<=0) return;
+   
+   //  tickVal = 0
+   if(tickVal == 0) tickVal = 1; 
+   if(tickSz == 0) tickSz = 0.01;
 
-   double loss_per_lot = sl/tickSz*tickVal;
-   if(loss_per_lot<=0) return;
+   double loss_per_lot = (sl / tickSz) * tickVal;
+   if(loss_per_lot == 0) loss_per_lot = 100; // Fallback
 
-   double lot = RiskUSD/loss_per_lot;
+   // Lot theo Risk
+   double lot = (RiskUSD * riskAdj) / loss_per_lot;
 
    double minLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
    double maxLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX);
@@ -227,16 +209,21 @@ void OnTick()
 
    lot = MathFloor(lot/step)*step;
    lot = MathMax(minLot,MathMin(lot,maxLot));
-   if(lot<minLot) return;
+   
+ if(lot < minLot) return;
 
-   // EXECUTION 
+   // EXECUTION
    trade.SetDeviationInPoints(20);
-
    bool ok;
+
    if(up)
       ok = trade.Buy(lot,_Symbol,ask,ask-sl,ask+tp);
    else
       ok = trade.Sell(lot,_Symbol,bid,bid+sl,bid-tp);
 
-   if(ok) bars_after_trade = 0;
+   if(ok)
+      bars_after_trade = 0;
+
+   PrintFormat("SCALP | Regime=%d vol=%.2f lot=%.2f",
+               regime, vol_ratio, lot);
 }
