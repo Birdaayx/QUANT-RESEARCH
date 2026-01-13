@@ -186,7 +186,7 @@ void OnTick()
       tp_mult *= 1.2;
 }
 
-   // MONEY MANAGEMENT FIX 
+   // Management 
    double sl = atrF * sl_mult;
    double tp = atrF * tp_mult;
 
