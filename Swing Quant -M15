@@ -1,0 +1,197 @@
+// SWING QUANT – M15 REGIME 
+
+#property strict
+#include <Trade/Trade.mqh>
+CTrade trade;
+
+// INPUTS
+input double RiskUSD        = 1.0;
+
+input int    ATR_Fast       = 14;
+input int    ATR_Slow       = 60;
+input int    Lookback       = 40;
+
+input double SL_ATR_Base    = 1.5;
+input double TP_ATR_Base    = 3.0;
+
+input double MaxSpreadATR  = 0.5;
+input int    CooldownBars  = 6;
+
+// GLOBAL
+datetime last_bar = 0;
+int bars_after_trade = 999;
+
+int atrFastHandle, atrSlowHandle;
+
+// HMM 
+#define N_STATE 3
+#define N_OBS   2
+// 0 = Compression | 1 = Transition | 2 = Expansion
+
+double HMM_A[N_STATE][N_STATE] =
+{
+   {0.85, 0.15, 0.00},
+   {0.10, 0.75, 0.15},
+   {0.05, 0.25, 0.70}
+};
+
+double HMM_MU[N_STATE][N_OBS] =
+{
+   {0.0, 0.6},
+   {0.0, 1.0},
+   {0.0, 1.5}
+};
+
+// HMM M15
+double HMM_VAR[N_STATE][N_OBS] =
+{
+   {1e-5, 0.08},
+   {2e-5, 0.15},
+   {4e-5, 0.30}
+};
+
+double log_alpha[N_STATE];
+
+// INIT
+int OnInit()
+{
+   atrFastHandle = iATR(_Symbol, PERIOD_M15, ATR_Fast);
+   atrSlowHandle = iATR(_Symbol, PERIOD_M15, ATR_Slow);
+   if(atrFastHandle == INVALID_HANDLE || atrSlowHandle == INVALID_HANDLE)
+      return INIT_FAILED;
+
+   for(int i=0;i<N_STATE;i++)
+      log_alpha[i] = MathLog(1.0 / N_STATE);
+
+   return INIT_SUCCEEDED;
+}
+
+// HELPERS 
+double ReadATR(int handle)
+{
+   double buf[1];
+   if(CopyBuffer(handle,0,1,1,buf)<=0) return 0;
+   return buf[0];
+}
+
+double LogGaussian(double x,double mu,double var)
+{
+   if(var <= 0) return -1e10;
+   return -0.5 * (MathLog(2.0*M_PI*var) + (x-mu)*(x-mu)/var);
+}
+
+double LogEmission(int state,const double &obs[])
+{
+   double logp = 0.0;
+   for(int i=0;i<N_OBS;i++)
+      logp += LogGaussian(obs[i], HMM_MU[state][i], HMM_VAR[state][i]);
+   return logp;
+}
+
+void HMM_Update(const double &obs[])
+{
+   double next_log_alpha[N_STATE];
+
+   for(int j=0;j<N_STATE;j++)
+   {
+      double maxv = -1e100;
+      for(int i=0;i<N_STATE;i++)
+         maxv = MathMax(maxv, log_alpha[i] + MathLog(HMM_A[i][j]));
+
+      double sum = 0.0;
+      for(int i=0;i<N_STATE;i++)
+         sum += MathExp(log_alpha[i] + MathLog(HMM_A[i][j]) - maxv);
+
+      next_log_alpha[j] = maxv + MathLog(sum) + LogEmission(j,obs);
+   }
+
+   double max_all = next_log_alpha[0];
+   for(int i=1;i<N_STATE;i++)
+      max_all = MathMax(max_all,next_log_alpha[i]);
+
+   double norm = 0.0;
+   for(int i=0;i<N_STATE;i++)
+      norm += MathExp(next_log_alpha[i]-max_all);
+
+   for(int i=0;i<N_STATE;i++)
+      log_alpha[i] = next_log_alpha[i] - (max_all + MathLog(norm));
+}
+
+int HMM_State()
+{
+   int best = 0;
+   for(int i=1;i<N_STATE;i++)
+      if(log_alpha[i] > log_alpha[best]) best = i;
+   return best;
+}
+
+// MAIN 
+void OnTick()
+{
+   datetime t = iTime(_Symbol, PERIOD_M15, 0);
+   if(t == last_bar) return;
+   last_bar = t;
+
+   bars_after_trade++;
+   if(PositionSelect(_Symbol)) return;
+   if(bars_after_trade < CooldownBars) return;
+
+   double atrF = ReadATR(atrFastHandle);
+   double atrS = ReadATR(atrSlowHandle);
+   if(atrF<=0 || atrS<=0) return;
+
+   double vol_ratio = atrF / atrS;
+
+   double c1 = iClose(_Symbol, PERIOD_M15, 1);
+   double c2 = iClose(_Symbol, PERIOD_M15, 2);
+   if(c1<=0 || c2<=0) return;
+
+   double obs[N_OBS];
+   obs[0] = MathLog(c1/c2);
+   obs[1] = vol_ratio;
+   HMM_Update(obs);
+
+   int regime = HMM_State();
+
+   // ❌ Không trade Compression
+   if(regime == 0) return;
+
+   double ask = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   if((ask-bid) > atrS * MaxSpreadATR) return;
+
+   int hi = iHighest(_Symbol,PERIOD_M15,MODE_HIGH,Lookback,1);
+   int lo = iLowest (_Symbol,PERIOD_M15,MODE_LOW ,Lookback,1);
+   if(hi<0 || lo<0) return;
+
+   bool up   = c1 > iHigh(_Symbol,PERIOD_M15,hi);
+   bool down = c1 < iLow (_Symbol,PERIOD_M15,lo);
+   if(!up && !down) return;
+
+   double sl = atrF * SL_ATR_Base;
+   double tp = atrF * TP_ATR_Base;
+
+   double tickVal = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
+   double tickSz  = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
+   if(tickVal == 0) tickVal = 1;
+   if(tickSz == 0) tickSz = 0.01;
+
+   double loss_per_lot = (sl / tickSz) * tickVal;
+   double lot = RiskUSD / loss_per_lot;
+
+   double minLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+   double step   = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+   lot = MathFloor(lot/step)*step;
+   if(lot < minLot) return;
+
+   trade.SetDeviationInPoints(30);
+
+   bool ok = up
+      ? trade.Buy (lot,_Symbol,ask,ask-sl,ask+tp)
+      : trade.Sell(lot,_Symbol,bid,bid+sl,bid-tp);
+
+   if(ok) bars_after_trade = 0;
+
+   PrintFormat("SWING M15 | Regime=%d vol=%.2f lot=%.2f",
+               regime, vol_ratio, lot);
+}
